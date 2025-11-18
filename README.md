@@ -58,4 +58,4 @@ python eval/eval_harness.py --data data/val.jsonl --model_id Qwen/Qwen2.5-VL-3B-
 - If VRAM still OOMs, try closing apps, lowering `--max_new_tokens`, or running with `--cpu_offload`.
 - For doc/CAD, consider pre‑cropping ROIs (less pixels → less memory and faster).
 
-Happy building!
+
