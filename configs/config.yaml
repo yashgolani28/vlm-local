@@ -1,0 +1,7 @@
+# configs/config.yaml
+model_id: Qwen/Qwen2.5-VL-3B-Instruct
+dtype: float16
+fourbit: true
+max_new_tokens: 256
+temperature: 0.2
+top_p: 0.95

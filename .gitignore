@@ -1,0 +1,44 @@
+# virtual env
+.venv/
+venv/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# model + cache dirs
+models/
+checkpoints/
+weights/
+outputs/
+logs/
+wandb/
+.cache/
+.qdrant/
+
+# data (keep only small configs)
+data/
+snapshots/
+retrieval_db/
+qdrant_storage/
+*.db
+
+# IDE / OS junk
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+
+# env / secrets
+.env
+.env.*
+*.secret
+
+# local media / samples
+assets/
+
+# debug / temp data
+src/retrieval_embeddings_debug.npy
