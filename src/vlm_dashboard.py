@@ -5,6 +5,7 @@ import json
 import base64
 import tempfile
 import sys
+import copy
 from datetime import datetime
 import re
 from collections import Counter
@@ -19,6 +20,8 @@ from retrieval_db import RetrievalDB
 from build_retrieval_db_from_captions import build_retrieval_db_from_jsonl
 from anpr import run_anpr, run_anpr_multi, INDIA_STATE_CODES
 from auto_caption_traffic_folder import main as auto_caption_main
+from train_lora_llava import run_llava_lora
+from train_lora_qwenvl import run_qwenvl_lora
 
 try:
     from ultralytics import YOLO
@@ -54,12 +57,12 @@ except Exception as e:
 # =========================
 
 # Ollama / LLaVA config
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-MODEL_NAME = "llava:7b"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
+MODEL_NAME = os.environ.get("OLLAMA_MODEL_NAME", "llava:13b")
 
 # Default RTSP for your Axis M1125
 DEFAULT_RTSP = (
-    "rtsp://root:2024@192.168.1.241/axis-media/media.amp?videocodec=h264"
+    "rtsp://root:2024@192.168.1.241/axis-media/media.amp?streamprofile=stream1"
 )
 
 # Dataset paths
@@ -71,14 +74,68 @@ DATASET_PATH = os.path.join(DATA_DIR, "traffic_vqa.jsonl")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Training / auto-caption log file
+TRAIN_LOG_PATH = os.path.join(DATA_DIR, "train_logs.txt")
+
+
+def append_train_log(header: str, text: str) -> None:
+    """
+    Append a chunk of log text into TRAIN_LOG_PATH with a small header + timestamp.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(TRAIN_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n\n===== {header} @ {ts} =====\n")
+            f.write(text)
+            f.write("\n")
+    except Exception as e:
+        # Silent fail so Streamlit doesn't crash
+        print(f"[TRAIN_LOG] Failed to write log: {e}")
+
+
+def run_with_logging(header: str, fn, *args, **kwargs):
+    """
+    Run a callable while capturing stdout/stderr, then append them to TRAIN_LOG_PATH.
+
+    Usage:
+        run_with_logging("TRAIN_LLAVA", run_llava_lora, train_path=..., out_dir=..., ...)
+    """
+    import io as _io
+    from contextlib import redirect_stdout, redirect_stderr
+
+    buf = _io.StringIO()
+    try:
+        with redirect_stdout(buf), redirect_stderr(buf):
+            result = fn(*args, **kwargs)
+    except Exception as e:
+        log_text = buf.getvalue()
+        log_text += f"\n\n[ERROR] {repr(e)}\n"
+        append_train_log(header, log_text)
+        raise
+    else:
+        log_text = buf.getvalue()
+        append_train_log(header, log_text)
+        return result
+
 # Backend selection + Qwen LoRA defaults
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
-DEFAULT_BACKEND = os.environ.get("VLM_BACKEND", "ollama_llava")  # or "qwenvl"
-QWEN_MODEL_ID = os.environ.get("VLM_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
+DEFAULT_BACKEND = os.environ.get("VLM_BACKEND", "qwenvl")  # default to Qwen on the new GPU
+QWEN_MODEL_ID = os.environ.get("VLM_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+
 QWEN_LORA_DIR = os.environ.get(
     "VLM_LORA_DIR",
-    os.path.join(PROJECT_ROOT, "outputs", "qwenvl_idd_lora_50"),
+    os.path.join(PROJECT_ROOT, "outputs", "qwenvl_lora"),
 )
+
+# ---- VLM generation budgets (tokens) ----
+BIG_MAX_NEW_TOKENS = int(os.environ.get("VLM_BIG_MAX_NEW_TOKENS", "512"))
+LIVE_MAX_NEW_TOKENS = int(os.environ.get("VLM_LIVE_MAX_NEW_TOKENS", "192"))
+DATASET_MAX_NEW_TOKENS = int(os.environ.get("VLM_DATASET_MAX_NEW_TOKENS", "384"))
+FAST_MAX_NEW_TOKENS = int(os.environ.get("VLM_MAX_NEW_TOKENS", "256"))
+
+# OCR config
+USE_VLM_OCR = os.environ.get("USE_VLM_OCR", "").lower() in ("1", "true", "yes", "on")
+PLATE_OCR_BACKEND = (os.environ.get("PLATE_OCR_BACKEND") or DEFAULT_BACKEND or "").lower()
 
 _qwen_model = None
 _qwen_processor = None
@@ -191,21 +248,13 @@ def call_llava_multi_images(b64_images, prompt: str) -> str:
 
 # ---------- Qwen2.5-VL + LoRA helpers ----------
 
-def get_qwenvl_lora():
+@st.cache_resource(show_spinner="Loading Qwen2.5-VL model (one-time, cached)...")
+def _load_qwenvl_lora_cached(model_id: str, lora_dir: str | None):
     """
-    Lazy-load Qwen2.5-VL + LoRA adapter for local inference (4-bit).
+    Load Qwen2.5-VL + optional LoRA once per Streamlit server process.
+    Subsequent calls reuse the cached model + processor.
     """
-    global _qwen_model, _qwen_processor
-
-    if not _HAS_QWEN:
-        raise RuntimeError(
-            "Qwen2.5-VL backend is not available in this environment.\n"
-            f"Original import error: {_QWEN_IMPORT_ERROR}"
-        )
-
-    if _qwen_model is not None and _qwen_processor is not None:
-        return _qwen_model, _qwen_processor
-
+    # 4-bit quantization for 7B on 16 GB GPU
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
@@ -213,33 +262,125 @@ def get_qwenvl_lora():
         bnb_4bit_quant_type="nf4",
     )
 
+    # Load base Qwen2.5-VL
     base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        QWEN_MODEL_ID,
+        model_id,
         quantization_config=bnb_config,
         device_map="auto",
     )
 
-    model = PeftModel.from_pretrained(base, QWEN_LORA_DIR)
+    model = base
+
+    # Try to attach LoRA only if the directory actually exists
+    if lora_dir and os.path.isdir(lora_dir):
+        try:
+            model = PeftModel.from_pretrained(base, lora_dir)
+        except Exception as e:
+            # Log / print but don't crash – just use base model
+            print(f"[QWEN] Failed to load LoRA from {lora_dir}: {e}")
+            model = base
+    else:
+        print(f"[QWEN] No valid LoRA dir at {lora_dir!r}, using base model only.")
+
     model.eval()
 
-    processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID)
+    # use_fast=True gets rid of the warning and uses the fast tokenizer / processor
+    processor = AutoProcessor.from_pretrained(model_id, use_fast=True)
 
-    _qwen_model = model
-    _qwen_processor = processor
     return model, processor
 
-def _qwenvl_generate(messages, max_new_tokens: int = 256) -> str:
+def get_qwenvl_lora():
+    """
+    Thin wrapper that uses the cached loader above.
+    The cache key is (QWEN_MODEL_ID, QWEN_LORA_DIR).
+    """
+    return _load_qwenvl_lora_cached(QWEN_MODEL_ID, QWEN_LORA_DIR)
+
+def _resize_image_for_vlm(img: Image.Image, max_long_side: int = 480) -> Image.Image:
+    """
+    Downscale input image for VLM only (ANPR uses full-res elsewhere).
+    Keeps aspect ratio; caps the longer side to max_long_side.
+    """
+    w, h = img.size
+    long_side = max(w, h)
+    if long_side <= max_long_side:
+        return img
+    scale = max_long_side / float(long_side)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return img.resize((new_w, new_h), Image.BILINEAR)
+
+
+def _estimate_edge_density(img: Image.Image) -> float:
+    """
+    Cheap 'complexity' metric: edge density on a small grayscale thumbnail.
+    Returns ~0.0 (very flat scene) up to ~0.2+ (very busy).
+    """
+    # Small thumbnail to keep this cheap
+    arr = np.array(img.resize((320, 320)))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    # edges is 0..255; mean/255 ≈ fraction of edge pixels
+    return float(edges.mean() / 255.0)
+
+
+def _auto_select_max_new_tokens(pil_images) -> int:
+    """
+    Pick max_new_tokens based on average visual complexity of the images.
+    Fewer tokens for very simple scenes; more for busy scenes.
+    """
+    if not pil_images:
+        # reasonable default if we somehow have no images
+        return 256
+
+    densities = [_estimate_edge_density(im) for im in pil_images]
+    score = float(np.mean(densities))
+
+    # very flat rural road / empty scene
+    if score < 0.015:
+        return 256
+    # normal scenes with a few vehicles / pedestrians
+    elif score < 0.035:
+        return 320
+    # denser traffic / more clutter
+    elif score < 0.07:
+        return 448
+    # very busy scene – allow long answers
+    else:
+        return 640
+
+
+def _qwenvl_generate(messages, max_new_tokens: int | None = None) -> str:
     """
     Shared generation helper for Qwen2.5-VL.
+    - Downscales images only for the VLM call (ANPR uses full-res elsewhere).
+    - If max_new_tokens is None, automatically picks a value based on
+      scene complexity (edge density heuristic).
     `messages` is a Qwen-style chat list with image(s) + text.
     """
     model, processor = get_qwenvl_lora()
 
+    # Work on a deep copy so we don't mutate caller's messages in-place
+    msgs = copy.deepcopy(messages)
+
+    pil_images_for_complexity = []
+    for m in msgs:
+        for c in m.get("content", []):
+            if isinstance(c, dict) and c.get("type") == "image":
+                img = c.get("image")
+                if isinstance(img, Image.Image):
+                    resized = _resize_image_for_vlm(img)
+                    c["image"] = resized
+                    pil_images_for_complexity.append(resized)
+
+    if max_new_tokens is None:
+        max_new_tokens = _auto_select_max_new_tokens(pil_images_for_complexity)
+
     text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        msgs, tokenize=False, add_generation_prompt=True
     )
 
-    image_inputs, video_inputs = process_vision_info(messages)
+    image_inputs, video_inputs = process_vision_info(msgs)
     proc_inputs = processor(
         text=[text],
         images=image_inputs,
@@ -253,11 +394,12 @@ def _qwenvl_generate(messages, max_new_tokens: int = 256) -> str:
         if isinstance(v, torch.Tensor):
             proc_inputs[k] = v.to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             **proc_inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
+            do_sample=False,  
+            temperature=1.0,   
         )
 
     # Strip the prompt tokens
@@ -270,9 +412,15 @@ def _qwenvl_generate(messages, max_new_tokens: int = 256) -> str:
     return out.strip()
 
 
-def call_qwenvl_single_image(img: Image.Image, prompt: str, max_new_tokens: int = 256) -> str:
+def call_qwenvl_single_image(
+    img: Image.Image,
+    prompt: str,
+    max_new_tokens: int | None = None,
+) -> str:
     """
     Run Qwen2.5-VL + LoRA on a single PIL image.
+    If max_new_tokens is None, a value is chosen automatically
+    based on scene complexity.
     """
     messages = [
         {
@@ -286,10 +434,15 @@ def call_qwenvl_single_image(img: Image.Image, prompt: str, max_new_tokens: int 
     return _qwenvl_generate(messages, max_new_tokens=max_new_tokens)
 
 
-def call_qwenvl_multi_frames(frames, prompt: str, max_new_tokens: int = 256) -> str:
+def call_qwenvl_multi_frames(
+    frames,
+    prompt: str,
+    max_new_tokens: int | None = None,
+) -> str:
     """
     Run Qwen2.5-VL + LoRA on multiple video frames (list of BGR numpy arrays).
     Treats them as multiple images in a single user turn.
+    If max_new_tokens is None, it's chosen automatically from overall complexity.
     """
     pil_images = [
         Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames
@@ -299,6 +452,88 @@ def call_qwenvl_multi_frames(frames, prompt: str, max_new_tokens: int = 256) -> 
     messages = [{"role": "user", "content": content}]
     return _qwenvl_generate(messages, max_new_tokens=max_new_tokens)
 
+# ---------- Plate OCR via VLM (Qwen / LLaVA) ----------
+
+def _clean_vlm_plate_text(raw_text: str) -> str:
+    """
+    Post-process raw VLM output into a clean plate string:
+    - take first line
+    - drop prefixes like 'Plate:'
+    - keep only A–Z, 0–9 and spaces
+    - collapse multiple spaces
+    """
+    if not raw_text:
+        return ""
+
+    import re
+
+    first_line = str(raw_text).strip().splitlines()[0]
+
+    # Drop leading 'plate:' or similar
+    first_line = re.sub(r"^[Pp]late[:\-]\s*", "", first_line)
+
+    filtered_chars = []
+    for ch in first_line:
+        if ch.isalnum():
+            filtered_chars.append(ch.upper())
+        elif ch in {" ", "-"}:
+            filtered_chars.append(" ")
+
+    plate = "".join(filtered_chars).strip()
+    # Collapse multiple spaces
+    plate = re.sub(r"\s+", " ", plate)
+
+    # Very short strings are likely garbage
+    if len(plate.replace(" ", "")) < 4:
+        return ""
+
+    return plate
+
+
+def vlm_ocr_plate_from_path(crop_path, backend=None):
+    """
+    Run Qwen or LLaVA OCR on a single cropped plate image.
+
+    Returns (plate_text, pseudo_confidence).
+    If OCR fails, returns ("", 0.0).
+    """
+    if not crop_path:
+        return "", 0.0
+
+    try:
+        img = Image.open(crop_path).convert("RGB")
+    except Exception as e:
+        print(f"[VLM_OCR] Failed to open crop {crop_path}: {e}")
+        return "", 0.0
+
+    backend = (backend or PLATE_OCR_BACKEND or DEFAULT_BACKEND or "").lower()
+    use_qwen = "qwen" in backend
+
+    prompt = (
+        "You are an OCR engine specialised in reading vehicle registration plates.\n"
+        "The image is a tightly cropped number plate from a traffic scene.\n"
+        "Return ONLY the exact registration number as a single line, for example:\n"
+        "  MH12AB1234\n"
+        "Do not add any extra words, punctuation, labels, or explanation."
+    )
+
+    try:
+        if use_qwen:
+            raw = call_qwenvl_single_image(img, prompt, max_new_tokens=32)
+        else:
+            # LLaVA via Ollama
+            b64 = pil_to_base64_jpeg(img)
+            raw = call_llava_single_image(b64, prompt)
+    except Exception as e:
+        print(f"[VLM_OCR] Backend call failed for {crop_path}: {e}")
+        return "", 0.0
+
+    plate = _clean_vlm_plate_text(raw)
+    if not plate:
+        return "", 0.0
+
+    pseudo_conf = 0.9
+    return plate, pseudo_conf
 
 # ---------- Video / RTSP helpers ----------
 
@@ -492,21 +727,33 @@ def run_anpr_on_frame(frame: np.ndarray, save_root: str = None, min_conf: float 
             outs = []
 
         for out in outs:
-            plate = (out.get("plate_text") or "").strip()
-            conf = float(out.get("plate_conf") or 0.0)
-            if not plate or conf < min_conf:
+            plate_text = (out.get("plate_text") or "").strip()
+            plate_conf = float(out.get("plate_conf") or 0.0)
+            crop_path = out.get("crop_path")
+
+            if USE_VLM_OCR and crop_path:
+                vlm_text, vlm_conf = vlm_ocr_plate_from_path(crop_path)
+                if vlm_text:
+                    # Prefer the higher-confidence source
+                    if vlm_conf >= plate_conf:
+                        plate_text = vlm_text
+                        plate_conf = float(vlm_conf)
+
+            # Final filtering after possible VLM override
+            if not plate_text or plate_conf < min_conf:
                 continue
 
             results.append(
                 {
-                    "vehicle_bbox": None,
-                    "vehicle_conf": 1.0,  # dummy value for display
-                    "plate_text": plate,
-                    "plate_conf": conf,
-                    "plate_bbox": out.get("plate_bbox"),
-                    "crop_path": out.get("crop_path"),
+                    "vehicle_bbox": None,                   
+                    "vehicle_conf": 1.0,                   
+                    "plate_text": plate_text,
+                    "plate_conf": plate_conf,
+                    "plate_bbox": out.get("plate_bbox"),        
+                    "crop_path": crop_path,
                 }
             )
+
         return results
 
     # ---------- Normal path: we have vehicle detections ----------
@@ -539,6 +786,39 @@ def run_anpr_on_frame(frame: np.ndarray, save_root: str = None, min_conf: float 
         )
 
     return results
+
+# ---- Tiny timing wrappers for VLM / ANPR / VLM_OCR ----
+
+# Global timing store (seconds)
+VLM_TIMINGS = {
+    "vlm": 0.0,      # call_qwenvl_single_image
+    "anpr": 0.0,     # run_anpr_on_frame
+    "vlm_ocr": 0.0,  # vlm_ocr_plate_from_path (sum over all calls)
+}
+
+def reset_timing_counters():
+    """Reset timing counters before each end-to-end run."""
+    for k in VLM_TIMINGS:
+        VLM_TIMINGS[k] = 0.0
+
+def _wrap_with_timing(func, key):
+    """Return a wrapped function that accumulates wall time in VLM_TIMINGS[key]."""
+    def wrapped(*args, **kwargs):
+        start = time.perf_counter()
+        out = func(*args, **kwargs)
+        VLM_TIMINGS[key] += time.perf_counter() - start
+        return out
+    return wrapped
+
+# Keep original refs in case you ever need them
+_call_qwenvl_single_image = call_qwenvl_single_image
+_run_anpr_on_frame = run_anpr_on_frame
+_vlm_ocr_plate_from_path = vlm_ocr_plate_from_path
+
+# Replace globals with timed versions everywhere in this file
+call_qwenvl_single_image = _wrap_with_timing(_call_qwenvl_single_image, "vlm")
+run_anpr_on_frame = _wrap_with_timing(_run_anpr_on_frame, "anpr")
+vlm_ocr_plate_from_path = _wrap_with_timing(_vlm_ocr_plate_from_path, "vlm_ocr")
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -676,8 +956,18 @@ def run_anpr_on_video_frames(frames, frame_indices, min_conf: float = 0.40):
             plate = (out.get("plate_text") or "").strip()
             conf = float(out.get("plate_conf") or 0.0)
             crop_path = out.get("crop_path")
+
+            # Optional: VLM OCR on the crop for video frames too
+            if USE_VLM_OCR and crop_path:
+                vlm_text, vlm_conf = vlm_ocr_plate_from_path(crop_path)
+                if vlm_text:
+                    if vlm_conf >= conf:
+                        plate = vlm_text
+                        conf = float(vlm_conf)
+
             if not plate or conf < min_conf:
                 continue
+
             results.append(
                 {
                     "frame_idx": vid_idx,
@@ -787,17 +1077,32 @@ def _shorten_for_history(text: str, max_chars: int = 600) -> str:
 def build_live_vlm_prompt(base_prompt: str, max_history_items: int = 3) -> str:
     """
     Build a history-aware prompt for the live camera.
-    Uses st.session_state["live_vlm_history"] (list of short strings).
+
+    - On the FIRST frame, send the full BIG_TRAFFIC_PROMPT once,
+      plus any extra instructions from `base_prompt`.
+    - On later frames, don't repeat the big prompt. Instead, show a
+      short history of previous summaries and treat `base_prompt`
+      as a small add-on / refinement.
     """
     history = st.session_state.get("live_vlm_history", [])
+
+    base_prompt = (base_prompt or "").strip()
+
     if not history:
+        # First ever call for this session
         prefix = (
             "You are observing frames from a fixed CCTV traffic camera. "
-            "This is the first frame for this session. "
-            "Give a clear description of the current scene.\n"
+            "This is the FIRST frame for this session.\n\n"
+            "First, give a clear, structured description of the current scene "
+            "using the detailed guidelines below.\n"
         )
-        return prefix + "\n" + base_prompt
+        extra = ""
+        if base_prompt:
+            extra = "\n\nAdditional instructions from the operator:\n" + base_prompt
 
+        return prefix + "\n" + default_prompt + extra
+
+    # We already have some history – focus on changes / deltas
     recent = history[-max_history_items:]
     history_lines = [
         f"[update {len(history) - len(recent) + i + 1}] {h}"
@@ -806,18 +1111,24 @@ def build_live_vlm_prompt(base_prompt: str, max_history_items: int = 3) -> str:
     history_text = "\n".join(history_lines)
 
     prefix = (
-        "You are observing a sequence of frames from the SAME fixed CCTV traffic camera. "
+        "You are observing a sequence of frames from the SAME fixed CCTV traffic camera.\n"
         "Below is a brief history of your OWN previous summaries for earlier frames, "
         "from oldest to newest:\n"
         f"{history_text}\n\n"
         "Now look at the NEW frame and:\n"
-        "- Describe the current state.\n"
+        "- Describe the current state succinctly.\n"
         "- Explicitly mention what CHANGED since the previous updates "
-        "(e.g., new vehicles entering or leaving, pedestrians appearing or disappearing, "
-        "traffic getting denser or lighter).\n"
+        "(new vehicles/pedestrians entering/leaving, traffic density changes, "
+        "any risky behaviour starting or stopping).\n"
+        "- You can assume the reader already knows the basic layout of the scene "
+        "from your first detailed summary, so you don't need to repeat everything.\n"
     )
-    return prefix + "\n" + base_prompt
 
+    extra = ""
+    if base_prompt:
+        extra = "\n\nAdditional instructions for this update:\n" + base_prompt
+
+    return prefix + extra
 
 def append_live_vlm_history(answer: str, max_items: int = 10) -> None:
     """
@@ -837,28 +1148,51 @@ def build_video_vlm_prompt(
 ) -> str:
     """
     Build a history-aware prompt for a given uploaded video.
-    Uses st.session_state['video_vlm_history'][video_key] (list of short strings).
+
+    - For the FIRST call for a given video_key, send BIG_TRAFFIC_PROMPT once
+      + clip-level instructions + the current user prompt.
+    - For later calls, don't repeat BIG_TRAFFIC_PROMPT. Use a short history of
+      previous answers and treat user_prompt as an incremental / refinement query.
     """
     hist_dict = st.session_state.get("video_vlm_history", {})
     history = hist_dict.get(video_key, [])
-    if not history:
-        # No previous answers for this video in this session.
-        return clip_prompt + "\nUser prompt:\n" + user_prompt
 
+    user_prompt = (user_prompt or "").strip()
+    clip_prompt = (clip_prompt or "").strip()
+
+    if not history:
+        # First question about this clip in this session
+        base = default_prompt
+        if clip_prompt:
+            base += "\n\nClip-level instructions:\n" + clip_prompt
+        if user_prompt:
+            base += "\n\nUser prompt:\n" + user_prompt
+        return base
+
+    # There is history for this video: focus on consistency and refinement
     recent = history[-max_history_items:]
     history_lines = [f"[prev {i+1}] {h}" for i, h in enumerate(recent)]
     history_text = "\n".join(history_lines)
 
     prefix = (
-        "You are analysing the SAME CCTV traffic video clip as in earlier questions. "
-        "Here are your previous summaries / answers for this clip "
-        "(oldest to newest):\n"
+        "You are analysing the SAME CCTV traffic video clip as in earlier questions.\n"
+        "Here are your previous summaries / answers for this clip (oldest to newest):\n"
         f"{history_text}\n\n"
         "Use these as context and stay consistent when answering the NEW user prompt below. "
-        "If the new prompt asks for different details, extend or refine your earlier answers "
-        "instead of contradicting them, unless you clearly correct a previous mistake.\n"
+        "Extend or refine your earlier answers instead of contradicting them, "
+        "unless you clearly correct a previous mistake.\n"
     )
-    return clip_prompt + "\n\n" + prefix + "\nUser prompt:\n" + user_prompt
+
+    base = ""
+    if clip_prompt:
+        base += "Clip-level instructions:\n" + clip_prompt + "\n\n"
+
+    base += prefix
+    if user_prompt:
+        base += "\nUser prompt:\n" + user_prompt
+
+    return base
+
 
 
 def append_video_vlm_history(video_key: str, answer: str, max_items: int = 5) -> None:
@@ -891,9 +1225,10 @@ st.sidebar.header("Backend & Connection")
 
 backend_choice = st.sidebar.radio(
     "Vision backend",
-    ["Ollama LLaVA (llava:7b)", "Qwen2.5-VL + LoRA"],
+    ["Ollama LLaVA (llava:13b)", "Qwen2.5-VL + LoRA"],
     index=0 if DEFAULT_BACKEND == "ollama_llava" else 1,
 )
+
 use_qwen = backend_choice.startswith("Qwen2.5")
 VLM_BACKEND = "qwenvl" if use_qwen else "ollama_llava"
 
@@ -904,8 +1239,8 @@ if not use_qwen:
         OLLAMA_URL = ollama_host
 
     st.sidebar.info(
-        "Make sure Ollama is running and `llava:7b` is pulled.\n\n"
-        "In PowerShell: `ollama pull llava:7b` then `ollama run llava:7b` (once)."
+        "This mode runs Qwen2.5-VL-7B (optionally with LoRA) directly in Python using 4-bit "
+        "quantization. Your 16 GB GPU should comfortably handle this."
     )
 else:
     st.sidebar.markdown(f"**Qwen base model:** `{QWEN_MODEL_ID}`")
@@ -916,9 +1251,11 @@ else:
              "(e.g. ./outputs/qwenvl_idd_lora_50).",
     )
     st.sidebar.info(
-        "This mode runs Qwen2.5-VL + the above LoRA directly in Python using 4-bit "
-        "quantization. Your RTX 3050 Ti should handle this with small batch sizes."
+        "Make sure Ollama is running and `llava:13b` is pulled.\n\n"
+        "In PowerShell: `ollama pull llava:13b` then (optionally) "
+        "`ollama run llava:13b` once to sanity-check."
     )
+
 
 tab_playground, tab_live, tab_search, tab_dataset = st.tabs(
     [
@@ -942,15 +1279,17 @@ with tab_playground:
     )
 
     default_prompt = (
-        "You are a traffic analysis assistant. Look at this traffic image or a small set of frames and reply in clear numbered points:\n"
-        "1. Describe the place (road type, junction or straight road, surroundings, lighting, weather).\n"
-        "2. Count visible vehicles by type (car, bike, truck, bus, auto, other) and mention whether they are mostly moving or stopped.\n"
-        "3. Count visible pedestrians and briefly say where they are relative to the road (on footpath, crossing, standing near lane, etc.).\n"
-        "4. Do NOT read or guess any license plate numbers yourself. A separate ANPR system will decode plates; just mention whether plates are visible and roughly how many.\n"
-        "5. State whether it looks like day, evening, night, or dawn/dusk and give a short justification.\n"
-        "6. Comment on any safety / risk factors you notice (e.g., jaywalking, vehicles too close, wrong-side driving, obscured lanes).\n"
-        "7. If you can guess the approximate region (city/country), say it and how confident you are; otherwise say you cannot tell.\n"
-        "Make the answer structured and reasonably detailed, but avoid unnecessary repetition."
+        "You are a traffic-analysis assistant. Use the following structure in your answer:\n"
+        "1. GLOBAL SCENE OVERVIEW (location type, camera angle, surroundings)\n"
+        "2. ROAD GEOMETRY & LANES (lane count per direction, divider, crossings, markings)\n"
+        "3. TRAFFIC COMPOSITION & COUNTS (per vehicle type + density)\n"
+        "4. PEDESTRIANS & OTHER ROAD USERS (counts + positions + behaviour)\n"
+        "5. TIME / LIGHTING / WEATHER (time of day, visibility, wet/dry roads)\n"
+        "6. INFRASTRUCTURE & SIGNAGE (signals, boards, barriers, speed breakers, etc.)\n"
+        "7. BEHAVIOUR & SAFETY ANALYSIS (lane discipline, conflicts, risks)\n"
+        "8. LICENSE PLATES (only mention that [license plate visible] or not, do NOT write numbers)\n"
+        "9. 3–5 BULLET SUMMARY of key facts and risks.\n\n"
+        "Write a detailed answer, but stay factual and avoid repetition."
     )
 
     prompt = st.text_area(
@@ -973,30 +1312,48 @@ with tab_playground:
         if uploaded_img is not None:
             img = Image.open(uploaded_img).convert("RGB")
             with col1:
-                st.image(img, caption="Uploaded Image", use_column_width=True)
+                st.image(img, caption="Uploaded Image", width='stretch')
 
-            if st.button("Run VLM on Image", type="primary"):
-                with st.spinner("Calling VLM backend + ANPR..."):
-                    try:
-                        # VLM
-                        if use_qwen:
-                            answer = call_qwenvl_single_image(img, prompt)
-                        else:
-                            b64 = pil_to_base64_jpeg(img)
-                            answer = call_llava_single_image(b64, prompt)
+        if st.button("Run VLM on Image", type="primary"):
+            with st.spinner("Calling VLM backend + ANPR..."):
+                try:
+                    if use_qwen:
+                        get_qwenvl_lora()
 
-                        # ANPR on all detected vehicles
-                        frame_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                        anpr_results = run_anpr_on_frame(frame_bgr)
-                    except Exception as e:
-                        st.error(f"Analysis failed: {e}")
+                    reset_timing_counters()
+
+                    # VLM
+                    if use_qwen:
+
+                        answer = call_qwenvl_single_image(
+                            img,
+                            prompt,
+                            max_new_tokens=BIG_MAX_NEW_TOKENS,
+                        )
                     else:
-                        with col2:
-                            st.markdown("### VLM Output")
-                            st.write(answer)
+                        b64 = pil_to_base64_jpeg(img)
+                        answer = call_llava_single_image(b64, prompt)
 
-                            anpr_container = st.container()
-                            render_anpr_results(anpr_results, anpr_container)
+                    # ANPR on all detected vehicles
+                    frame_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                    anpr_results = run_anpr_on_frame(frame_bgr)
+
+                except Exception as e:
+                    st.error(f"Analysis failed: {e}")
+                else:
+                    with col2:
+                        st.markdown("### VLM Output")
+                        st.write(answer)
+
+                        # timing line
+                        st.caption(
+                            f"VLM: {VLM_TIMINGS['vlm']:.2f} s, "
+                            f"ANPR: {VLM_TIMINGS['anpr']:.2f} s, "
+                            f"VLM_OCR: {VLM_TIMINGS['vlm_ocr']:.2f} s"
+                        )
+
+                        anpr_container = st.container()
+                        render_anpr_results(anpr_results, anpr_container)
 
                         # Cache last analyzed image + outputs for retrieval DB indexing
                         try:
@@ -1096,8 +1453,11 @@ with tab_playground:
 
                         if use_qwen:
                             answer = call_qwenvl_multi_frames(
-                                frames, full_prompt, max_new_tokens=256
+                                frames,
+                                full_prompt,
+                                max_new_tokens=FAST_MAX_NEW_TOKENS,
                             )
+
                         else:
                             b64_list = [frame_to_base64_jpeg(f) for f in frames]
                             answer = call_llava_multi_images(b64_list, full_prompt)
@@ -1117,13 +1477,12 @@ with tab_playground:
                             anpr_error = f"ANPR on video frames failed: {anpr_exc}"
 
                         with col2:
-                            st.markdown("### Sampled Frames (first up to 4)")
-                            show_n = min(4, len(frames))
-                            for i in range(show_n):
+                            st.markdown(f"### Sampled Frames ({len(frames)} total)")
+                            for frame, idx in zip(frames, indices):
                                 st.image(
-                                    cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB),
-                                    caption=f"Frame index {indices[i]}",
-                                    use_column_width=True,
+                                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                    caption=f"Frame index {idx}",
+                                    width='stretch',
                                 )
 
                             st.markdown("### VLM Video Summary")
@@ -1218,19 +1577,13 @@ with tab_live:
         rtsp_url = st.text_input(
             "RTSP URL",
             value=DEFAULT_RTSP,
-            help="Axis example: rtsp://user:pass@ip/axis-media/media.amp?videocodec=h264",
+            help="Axis example: rtsp://root:2024@192.168.1.241/axis-media/media.amp?streamprofile=stream1",
         )
 
         live_prompt_default = (
-            "You are a traffic analysis assistant. Look at this single frame from a fixed CCTV traffic camera "
-            "and answer concisely in numbered points:\n"
-            "1. Describe the place (e.g., highway, junction, lane count, surroundings).\n"
-            "2. Count visible vehicles (by type: car, bike, truck, bus, auto, other).\n"
-            "3. Count visible pedestrians and where they are.\n"
-            "4. Do NOT read or guess any license plate numbers yourself. A separate ANPR system will provide plate text; "
-            "simply mention that plates are present or not.\n"
-            "5. Is it day, evening, night, or dawn/dusk? Justify briefly.\n"
-            "6. If you can guess approximate region (city/country), say it and your confidence; else say you cannot tell."
+            "You are a scene-analysis assistant observing frames from a fixed CCTV camera. "
+            "Provide a detailed description of the current scene, including layout, "  
+            "vehicle and pedestrian activity, time of day, weather conditions, and any notable events."
         )
 
         live_prompt = st.text_area(
@@ -1271,12 +1624,22 @@ with tab_live:
         with st.spinner("Capturing frame and calling VLM + ANPR..."):
             try:
                 frame = capture_rtsp_frame(rtsp_url)
+                if use_qwen:
+                    get_qwenvl_lora()
+
+                reset_timing_counters()
 
                 # VLM (history-aware)
                 if use_qwen:
                     img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     full_live_prompt = build_live_vlm_prompt(live_prompt)
-                    answer = call_qwenvl_single_image(img_pil, full_live_prompt)
+                    answer = call_qwenvl_single_image(
+                        img_pil,
+                        full_live_prompt,
+                        max_new_tokens=LIVE_MAX_NEW_TOKENS,
+                    )
+
+
                 else:
                     b64 = frame_to_base64_jpeg(frame)
                     full_live_prompt = build_live_vlm_prompt(live_prompt)
@@ -1287,14 +1650,19 @@ with tab_live:
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_placeholder.image(
-                    frame_rgb, caption="Live Frame from RTSP", use_column_width=True
+                    frame_rgb, caption="Live Frame from RTSP", width='stretch'
                 )
                 result_placeholder.markdown("### VLM Live Analysis (single shot)")
                 result_placeholder.write(answer)
                 append_live_vlm_history(answer)
                 render_anpr_results(anpr_results, anpr_placeholder)
                 update_live_anpr_history(anpr_results, summary_placeholder)
-                status_placeholder.info("Last update: single capture")
+                status_placeholder.info(
+                    f"Last update: single capture  |  "
+                    f"VLM: {VLM_TIMINGS['vlm']:.2f} s, "
+                    f"ANPR: {VLM_TIMINGS['anpr']:.2f} s, "
+                    f"VLM_OCR: {VLM_TIMINGS['vlm_ocr']:.2f} s"
+                )
 
             except Exception as e:
                 st.error(f"Live capture or analysis failed: {e}")
@@ -1305,15 +1673,22 @@ with tab_live:
             f"Starting continuous analysis: every {interval:.1f}s for {max_updates} updates. "
             "This will run inside the app – to stop early, interrupt the app or reload the page."
         )
+        if use_qwen:
+            get_qwenvl_lora()
         for i in range(int(max_updates)):
             try:
                 frame = capture_rtsp_frame(rtsp_url)
-
+                reset_timing_counters()
                 # VLM (history-aware)
                 if use_qwen:
                     img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     full_live_prompt = build_live_vlm_prompt(live_prompt)
-                    answer = call_qwenvl_single_image(img_pil, full_live_prompt)
+                    answer = call_qwenvl_single_image(
+                        img_pil,
+                        full_live_prompt,
+                        max_new_tokens=LIVE_MAX_NEW_TOKENS,
+                    )
+
                 else:
                     b64 = frame_to_base64_jpeg(frame)
                     full_live_prompt = build_live_vlm_prompt(live_prompt)
@@ -1326,7 +1701,7 @@ with tab_live:
                 frame_placeholder.image(
                     frame_rgb,
                     caption=f"Live Frame #{i+1} from RTSP",
-                    use_column_width=True,
+                    width='stretch',
                 )
                 result_placeholder.markdown(
                     f"### VLM Live Analysis (update {i+1}/{int(max_updates)})"
@@ -1338,8 +1713,12 @@ with tab_live:
 
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 status_placeholder.success(
-                    f"Last update #{i+1} at {ts} – next in {interval:.1f}s"
+                    f"Last update #{i+1} at {ts} – next in {interval:.1f}s | "
+                    f"VLM: {VLM_TIMINGS['vlm']:.2f} s, "
+                    f"ANPR: {VLM_TIMINGS['anpr']:.2f} s, "
+                    f"VLM_OCR: {VLM_TIMINGS['vlm_ocr']:.2f} s"
                 )
+
             except Exception as e:
                 status_placeholder.error(f"Update #{i+1} failed: {e}")
 
@@ -1352,6 +1731,22 @@ with tab_live:
 # =========================
 # TAB 3 – Search / Retrieval
 # =========================
+
+def _highlight_query_in_text(text: str, query: str) -> str:
+    """
+    Simple case-insensitive highlighter for search query inside a caption.
+    Wraps matches in ** ** so they appear bold in the Streamlit markdown.
+    """
+    if not text or not query:
+        return text
+
+    import re as _re
+    pattern = _re.compile(_re.escape(query), _re.IGNORECASE)
+
+    def repl(match):
+        return f"**{match.group(0)}**"
+
+    return pattern.sub(repl, text)
 
 with tab_search:
     st.subheader("🔍 Search stored images / videos")
@@ -1624,6 +2019,10 @@ with tab_search:
                     "or the offline script."
                 )
             else:
+                # Show the query once above all results
+                norm_query = query.strip()
+                st.markdown(f"**Search query:** `{norm_query}`")
+
                 for idx, item in enumerate(results, start=1):
                     score = item.get("score")
                     media_type = item.get("type", "?")
@@ -1642,8 +2041,12 @@ with tab_search:
                     with meta_col:
                         if path:
                             st.caption(os.path.basename(path))
+
                         if caption:
-                            st.write(caption)
+                            # Highlight query inside the retrieved caption (semantic mode especially)
+                            highlighted = _highlight_query_in_text(caption, norm_query)
+                            st.markdown(highlighted)
+
                         if plates:
                             st.markdown("**Plates:** " + ", ".join(plates))
                         if created_at:
@@ -1652,7 +2055,7 @@ with tab_search:
                     with preview_col:
                         if path and os.path.exists(path):
                             if media_type == "image":
-                                st.image(path, use_column_width=True)
+                                st.image(path, width='stretch')
                             elif media_type == "video":
                                 st.video(path)
                         else:
@@ -1742,7 +2145,12 @@ with tab_dataset:
                 auto_prompt = ds_instruction.strip()
                 with st.spinner("Calling selected VLM backend to draft answer..."):
                     if use_qwen:
-                        draft = call_qwenvl_single_image(img, auto_prompt)
+                        draft = call_qwenvl_single_image(
+                            img,
+                            auto_prompt,
+                            max_new_tokens=DATASET_MAX_NEW_TOKENS,
+                        )
+
                     else:
                         b64 = pil_to_base64_jpeg(img)
                         draft = call_llava_single_image(b64, auto_prompt)
@@ -1828,13 +2236,19 @@ with tab_dataset:
                 img = Image.open(eval_img_file).convert("RGB")
                 with st.spinner("Calling VLM backend..."):
                     if use_qwen:
-                        answer = call_qwenvl_single_image(img, eval_instruction.strip())
+                        answer = call_qwenvl_single_image(
+                            img,
+                            eval_instruction.strip(),
+                            max_new_tokens=DATASET_MAX_NEW_TOKENS,
+                        )
+
+
                     else:
                         b64 = pil_to_base64_jpeg(img)
                         answer = call_llava_single_image(b64, eval_instruction.strip())
 
                 st.markdown("##### Uploaded Image")
-                st.image(img, use_column_width=True)
+                st.image(img, width='stretch')
 
                 st.markdown("##### VLM Answer")
                 st.write(answer)
@@ -1846,35 +2260,348 @@ with tab_dataset:
             except Exception as e:
                 st.error(f"Evaluation failed: {e}")
 
+    # =========================
+    # Auto-caption + training helper
+    # =========================
+
     st.markdown("---")
-    st.markdown("#### 🛠 Training command template (for later / remote GPUs)")
+    st.markdown("#### 🚀 Auto-caption + training helper (LLaVA captions → LoRA)")
 
-    example_cmd = f"""# Example: LLaVA-LoRA training on traffic dataset (conceptual)
-# Assuming:
-#   - LLaVA repo cloned at ~/llava
-#   - Base model: liuhaotian/llava-v1.5-7b
-#   - Dataset JSONL: ./data/traffic_vqa.jsonl
-#   - Images folder: ./data/traffic_images
+    # NOTE: by default, on your setup:
+    # - train_images_dir = D:\vlm\vlm-local\data\traffic_images
+    # - train_jsonl_path = D:\vlm\vlm-local\data\traffic_captions.jsonl
+    train_images_dir = st.text_input(
+        "Images folder for training (used by auto-caption step)",
+        value=IMAGES_DIR,
+        help="All images under this folder will be captioned by LLaVA and used as training data.",
+    )
 
-cd ~/llava
+    default_train_jsonl = os.path.join(DATA_DIR, "traffic_captions.jsonl")
+    train_jsonl_path = st.text_input(
+        "Captions JSONL for training",
+        value=default_train_jsonl,
+        help="JSONL with `image`, `prompt`, `answer` fields (from auto_caption_traffic_folder.py).",
+    )
 
-torchrun --nproc_per_node=8 --master_port=29501 \\
-    train.py \\
-    --model-path liuhaotian/llava-v1.5-7b \\
-    --data-path ./data/traffic_vqa.jsonl \\
-    --image-folder ./data/traffic_images \\
-    --vision-tower openai/clip-vit-large-patch14-336 \\
-    --mm-projector-type mlp2x_gelu \\
-    --mm-vision-resolution 336 \\
-    --output-dir ./checkpoints/llava-traffic-lora \\
-    --num-epochs 3 \\
-    --per-device-train-batch-size 2 \\
-    --per-device-eval-batch-size 2 \\
-    --learning-rate 2e-4 \\
-    --lora-r 64 --lora-alpha 128 --lora-target-modules q_proj,v_proj,k_proj,o_proj \\
-    --gradient-accumulation-steps 8 \\
-    --save-steps 1000 --eval-steps 1000
+    col_cap, col_train = st.columns(2)
 
-# For Qwen2.5-VL you already used train_lora_qwenvl.py locally.
+    # --- Step 1: auto-caption with LLaVA via Ollama ---
+    with col_cap:
+        if st.button("🧾 Auto-caption dataset with LLaVA (Ollama)", key="btn_ds_autocap"):
+            imgs_dir = train_images_dir.strip()
+            out_jsonl = train_jsonl_path.strip()
+
+            if not imgs_dir:
+                st.error("Please specify an images folder to caption.")
+            elif not out_jsonl:
+                st.error("Please specify a captions JSONL path.")
+            else:
+                try:
+                    def _run_autocap_ds():
+                        old_argv = sys.argv
+                        try:
+                            argv = [
+                                "auto_caption_traffic_folder",
+                                "--images_dir",
+                                imgs_dir,
+                                "--out",
+                                out_jsonl,
+                                "--ollama_url",
+                                OLLAMA_URL,
+                                "--model_name",
+                                MODEL_NAME,
+                            ]
+                            sys.argv = argv
+                            auto_caption_main()
+                        finally:
+                            sys.argv = old_argv
+
+                    with st.spinner(
+                        f"Auto-captioning images under {imgs_dir} into {out_jsonl} "
+                        f"using {MODEL_NAME} via Ollama..."
+                    ):
+                        run_with_logging(
+                            f"AUTO_CAPTION_DATASET images_dir={imgs_dir} out={out_jsonl}",
+                            _run_autocap_ds,
+                        )
+
+                    st.success(
+                        f"Auto-captioning completed. Captions written to: {out_jsonl}"
+                    )
+                except Exception as e:
+                    st.error(f"Auto-captioning failed: {e}")
+
+    # --- Step 2: training helpers for LLaVA / Qwen ---
+    with col_train:
+        train_target = st.selectbox(
+            "Generate training command for",
+            ["LLaVA-HF (llava-1.5-7b)", "Qwen2.5-VL-7B"],
+            key="train_target_select",
+        )
+
+        default_out_dir = (
+            os.path.join(PROJECT_ROOT, "outputs", "llava_traffic_lora")
+            if train_target.startswith("LLaVA")
+            else os.path.join(PROJECT_ROOT, "outputs", "qwenvl_traffic_lora")
+        )
+
+        train_out_dir = st.text_input(
+            "LoRA output directory",
+            value=default_out_dir,
+            key="train_out_dir",
+        )
+
+        show_cmd_btn = st.button(
+            "📋 Show training command (manual run)", key="btn_show_train_cmd"
+        )
+
+        if show_cmd_btn:
+            jsonl_rel = os.path.relpath(train_jsonl_path, PROJECT_ROOT)
+            out_rel = os.path.relpath(train_out_dir, PROJECT_ROOT)
+
+            if train_target.startswith("LLaVA"):
+                cmd = f"""# from the project root (where src/ lives)
+python src\\train_lora_llava.py `
+  --train "{jsonl_rel}" `
+  --out "{out_rel}" `
+  --model_id "llava-hf/llava-1.5-7b-hf" `
+  --epochs 1 `
+  --bs 1 `
+  --ga 16 `
+  --lr 2e-4 `
+  --max_length 512 `
+  --fourbit
 """
-    st.code(example_cmd, language="bash")
+            else:
+                cmd = f"""# from the project root (where src/ lives)
+python src\\train_lora_qwenvl.py `
+  --train "{jsonl_rel}" `
+  --out "{out_rel}" `
+  --model_id "{QWEN_MODEL_ID}" `
+  --epochs 1 `
+  --bs 1 `
+  --ga 8 `
+  --lr 2e-4 `
+  --max_length 1024
+"""
+
+            st.markdown(
+                "Copy–paste this into **PowerShell** from the project root to start training."
+            )
+            st.code(cmd, language="powershell")
+
+        st.markdown("##### 🔌 One-click training on current LLaVA captions")
+
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            btn_train_llava = st.button(
+                "🚀 Train LLaVA LoRA now", key="btn_train_llava_now"
+            )
+        with col_t2:
+            btn_train_qwen = st.button(
+                "🚀 Train Qwen2.5-VL LoRA now", key="btn_train_qwenvl_now"
+            )
+
+        if btn_train_llava or btn_train_qwen:
+            captions_path = train_jsonl_path.strip()
+            if not captions_path or not os.path.exists(captions_path):
+                st.error(
+                    "Captions JSONL not found. "
+                    "Run the auto-caption step above first so LLaVA can generate captions."
+                )
+            else:
+                os.makedirs(train_out_dir, exist_ok=True)
+                try:
+                    # LLaVA LoRA on LLaVA captions
+                    if btn_train_llava:
+                        with st.spinner(
+                            "Training LLaVA-HF LoRA on LLaVA auto-captions "
+                            "(this may take a while)..."
+                        ):
+                            run_with_logging(
+                                f"TRAIN_LLAVA train={captions_path} out={train_out_dir}",
+                                run_llava_lora,
+                                train_path=captions_path,
+                                out_dir=train_out_dir,
+                                model_id="llava-hf/llava-1.5-7b-hf",
+                                epochs=1,
+                                bs=1,
+                                ga=16,
+                                lr=2e-4,
+                                max_length=512,
+                                fourbit=True,
+                            )
+                        st.success(
+                            f"LLaVA LoRA training complete. "
+                            f"Adapters saved to: `{train_out_dir}`"
+                        )
+
+                    # Qwen LoRA on the same LLaVA captions
+                    if btn_train_qwen:
+                        with st.spinner(
+                            "Training Qwen2.5-VL LoRA on LLaVA auto-captions "
+                            "(this may take a while)..."
+                        ):
+                            run_with_logging(
+                                f"TRAIN_QWEN train={captions_path} out={train_out_dir}",
+                                run_qwenvl_lora,
+                                train_path=captions_path,
+                                out_dir=train_out_dir,
+                                model_id=QWEN_MODEL_ID,
+                                epochs=1,
+                                bs=1,
+                                ga=8,
+                                lr=2e-4,
+                                max_length=1024,
+                            )
+                        st.success(
+                            f"Qwen2.5-VL LoRA training complete. "
+                            f"Adapters saved to: `{train_out_dir}`.\n\n"
+                            "To start USING it in the dashboard, set the "
+                            "Qwen LoRA directory in the sidebar to this path."
+                        )
+
+                except Exception as e:
+                    st.error(f"LoRA training failed: {e}")
+
+        # --- Step 3: ONE BUTTON to do everything ---
+        st.markdown("---")
+        st.markdown("##### 🧨 Full pipeline: auto-caption + train both models")
+
+        btn_autocap_and_train = st.button(
+            "🔥 Auto-caption folder + train LLaVA & Qwen",
+            key="btn_autocap_and_train_all",
+        )
+
+        if btn_autocap_and_train:
+            imgs_dir = train_images_dir.strip()
+            captions_path = train_jsonl_path.strip()
+
+            if not imgs_dir:
+                st.error("Please specify an images folder in the left column.")
+            elif not captions_path:
+                st.error("Please specify a captions JSONL path above.")
+            else:
+                # Fixed default output dirs under your project:
+                llava_out_dir = os.path.join(PROJECT_ROOT, "outputs", "llava_traffic_lora")
+                qwenvl_out_dir = os.path.join(PROJECT_ROOT, "outputs", "qwenvl_traffic_lora")
+
+                os.makedirs(os.path.dirname(llava_out_dir), exist_ok=True)
+                os.makedirs(os.path.dirname(qwenvl_out_dir), exist_ok=True)
+
+                try:
+                    # STEP 1: Auto-caption with LLaVA via Ollama
+                    def _run_autocap_full():
+                        old_argv = sys.argv
+                        try:
+                            argv = [
+                                "auto_caption_traffic_folder",
+                                "--images_dir",
+                                imgs_dir,
+                                "--out",
+                                captions_path,
+                                "--ollama_url",
+                                OLLAMA_URL,
+                                "--model_name",
+                                MODEL_NAME,
+                            ]
+                            sys.argv = argv
+                            auto_caption_main()
+                        finally:
+                            sys.argv = old_argv
+
+                    with st.spinner(
+                        f"Auto-captioning images under {imgs_dir} into {captions_path} "
+                        f"using {MODEL_NAME} via Ollama..."
+                    ):
+                        run_with_logging(
+                            f"AUTO_CAPTION_FULL images_dir={imgs_dir} out={captions_path}",
+                            _run_autocap_full,
+                        )
+
+                    # STEP 2: Train LLaVA LoRA on those captions
+                    with st.spinner(
+                        "Training LLaVA-HF LoRA on the generated captions "
+                        "(this may take a while)..."
+                    ):
+                        run_with_logging(
+                            f"TRAIN_LLAVA_FULL train={captions_path} out={llava_out_dir}",
+                            run_llava_lora,
+                            train_path=captions_path,
+                            out_dir=llava_out_dir,
+                            model_id="llava-hf/llava-1.5-7b-hf",
+                            epochs=1,
+                            bs=1,
+                            ga=16,
+                            lr=2e-4,
+                            max_length=512,
+                            fourbit=True,
+                        )
+
+                    # STEP 3: Train Qwen LoRA on the same captions
+                    with st.spinner(
+                        "Training Qwen2.5-VL LoRA on the generated captions "
+                        "(this may take a while)..."
+                    ):
+                        run_with_logging(
+                            f"TRAIN_QWEN_FULL train={captions_path} out={qwenvl_out_dir}",
+                            run_qwenvl_lora,
+                            train_path=captions_path,
+                            out_dir=qwenvl_out_dir,
+                            model_id=QWEN_MODEL_ID,
+                            epochs=1,
+                            bs=1,
+                            ga=8,
+                            lr=2e-4,
+                            max_length=1024,
+                        )
+
+                    st.success(
+                        "Full pipeline complete.\n\n"
+                        f"- Captions JSONL: `{captions_path}`\n"
+                        f"- LLaVA LoRA saved at: `{llava_out_dir}`\n"
+                        f"- Qwen2.5-VL LoRA saved at: `{qwenvl_out_dir}`\n\n"
+                        "You can inspect all logs in the 'Training / auto-caption logs' panel below. "
+                        "To start USING the new Qwen LoRA in the dashboard, set the sidebar "
+                        "LoRA directory to the Qwen output path above."
+                    )
+                except Exception as e:
+                    st.error(f"Full pipeline failed: {e}")
+                    
+    # =========================
+    # Training / auto-caption logs viewer
+    # =========================
+
+    st.markdown("---")
+    st.markdown("#### 📜 Training / auto-caption logs")
+
+    col_log_left, col_log_right = st.columns(2)
+    with col_log_left:
+        refresh_log = st.button("🔄 Refresh log view", key="btn_refresh_train_log")
+    with col_log_right:
+        clear_log = st.button("🧹 Clear logs", key="btn_clear_train_log")
+
+    log_exists = os.path.exists(TRAIN_LOG_PATH)
+
+    if clear_log and log_exists:
+        try:
+            os.remove(TRAIN_LOG_PATH)
+            st.success("Training logs cleared.")
+            log_exists = False
+        except Exception as e:
+            st.error(f"Failed to clear training logs: {e}")
+
+    if not log_exists:
+        st.info("No training logs yet. Run auto-caption or LoRA training to populate this.")
+    else:
+        try:
+            with open(TRAIN_LOG_PATH, "r", encoding="utf-8") as f:
+                log_text = f.read()
+        except Exception as e:
+            st.error(f"Failed to read training log file: {e}")
+        else:
+            st.text_area(
+                "Recent training / auto-caption logs",
+                value=log_text,
+                height=320,
+            )

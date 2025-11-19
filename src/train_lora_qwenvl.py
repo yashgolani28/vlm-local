@@ -2,7 +2,7 @@ import os
 import json
 import argparse
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -15,11 +15,6 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from qwen_vl_utils import process_vision_info
-
-
-# -----------------------------
-# Dataset: just image / prompt / answer
-# -----------------------------
 
 
 class QwenVLDataset(Dataset):
@@ -48,13 +43,7 @@ class QwenVLDataset(Dataset):
         return len(self.rows)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Return raw fields; collator will do all heavy lifting
         return self.rows[idx]
-
-
-# -----------------------------
-# Collator: build messages, run processor, build training tensors
-# -----------------------------
 
 
 @dataclass
@@ -68,7 +57,7 @@ class QwenCollator:
         """
         tokenizer = self.processor.tokenizer
 
-        # 1) Build Qwen-style messages for the whole batch
+        # 1) Messages + answers
         messages_batch: List[List[Dict[str, Any]]] = []
         answers: List[str] = []
 
@@ -77,7 +66,6 @@ class QwenCollator:
             prompt = f["prompt"]
             answer = f["answer"]
 
-            # Single-user-turn message with image + text
             messages = [
                 {
                     "role": "user",
@@ -95,7 +83,7 @@ class QwenCollator:
             messages_batch.append(messages)
             answers.append(answer)
 
-        # 2) Apply chat template to all messages
+        # 2) Chat template
         texts: List[str] = [
             self.processor.apply_chat_template(
                 m, tokenize=False, add_generation_prompt=True
@@ -103,7 +91,7 @@ class QwenCollator:
             for m in messages_batch
         ]
 
-        # 3) Vision preprocessing for the batch (this is the critical part)
+        # 3) Vision preprocessing
         image_inputs, video_inputs = process_vision_info(messages_batch)
         proc_out = self.processor(
             text=texts,
@@ -113,10 +101,10 @@ class QwenCollator:
             return_tensors="pt",
         )
 
-        instr_input_ids: torch.Tensor = proc_out["input_ids"]         # (B, L_instr)
-        instr_attention: torch.Tensor = proc_out["attention_mask"]    # (B, L_instr)
-        pixel_values: torch.Tensor = proc_out["pixel_values"]         # vision batch
-        image_grid_thw: torch.Tensor = proc_out["image_grid_thw"]     # grid metadata
+        instr_input_ids: torch.Tensor = proc_out["input_ids"]
+        instr_attention: torch.Tensor = proc_out["attention_mask"]
+        pixel_values: torch.Tensor = proc_out["pixel_values"]
+        image_grid_thw: torch.Tensor = proc_out["image_grid_thw"]
 
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
@@ -126,31 +114,30 @@ class QwenCollator:
         new_attention: List[torch.Tensor] = []
         new_labels: List[torch.Tensor] = []
 
-        # 4) For each sample, append answer tokens and build labels
+        # 4) Append answer tokens and build labels
         for i, answer in enumerate(answers):
             instr_ids = instr_input_ids[i]
             instr_attn = instr_attention[i]
 
-            # Answer tokens
             resp = tokenizer(answer, add_special_tokens=False)
             resp_ids = torch.tensor(resp["input_ids"], dtype=torch.long)
             resp_attn = torch.ones_like(resp_ids, dtype=torch.long)
 
-            # Sequence: [INSTRUCTION][ANSWER][PAD]
             ids = torch.cat(
-                [instr_ids, resp_ids, torch.tensor([pad_id], dtype=torch.long)], dim=0
+                [instr_ids, resp_ids, torch.tensor([pad_id], dtype=torch.long)],
+                dim=0,
             )
             attn = torch.cat(
-                [instr_attn, resp_attn, torch.ones(1, dtype=torch.long)], dim=0
+                [instr_attn, resp_attn, torch.ones(1, dtype=torch.long)],
+                dim=0,
             )
 
-            # Loss only on answer + final pad; ignore instruction
             labels_instr = torch.full_like(instr_ids, -100)
             labels = torch.cat(
-                [labels_instr, resp_ids, torch.tensor([pad_id], dtype=torch.long)], dim=0
+                [labels_instr, resp_ids, torch.tensor([pad_id], dtype=torch.long)],
+                dim=0,
             )
 
-            # Truncate to max_length if needed
             if ids.size(0) > self.max_length:
                 ids = ids[: self.max_length]
                 attn = attn[: self.max_length]
@@ -160,7 +147,7 @@ class QwenCollator:
             new_attention.append(attn)
             new_labels.append(labels)
 
-        # 5) Pad to a batch tensor manually (avoids tokenizer.pad API differences)
+        # 5) Manual padding
         batch_size = len(new_input_ids)
         max_len = max(t.size(0) for t in new_input_ids)
 
@@ -182,7 +169,6 @@ class QwenCollator:
             attention_batch[i, :L] = attn
             labels_batch[i, :L] = lab
 
-        # 6) Final batch dict
         return {
             "input_ids": input_ids_batch,
             "attention_mask": attention_batch,
@@ -192,38 +178,12 @@ class QwenCollator:
         }
 
 
-# -----------------------------
-# Main training entrypoint
-# -----------------------------
-
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="LoRA fine-tuning for Qwen2.5-VL on traffic captions (jsonl)."
-    )
-    ap.add_argument("--train", required=True, help="Train jsonl (image/prompt/answer per line)")
-    ap.add_argument("--val", help="Val jsonl (optional)")
-    ap.add_argument("--out", required=True, help="Output dir for LoRA")
-    ap.add_argument(
-        "--model_id",
-        default="Qwen/Qwen2.5-VL-3B-Instruct",
-        help="Base Qwen2.5-VL model",
-    )
-    ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--bs", type=int, default=1)
-    ap.add_argument("--ga", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument(
-        "--max_length", type=int, default=1024, help="Max token length for text sequence"
-    )
-    args = ap.parse_args()
-
+def _run_from_args(args: argparse.Namespace) -> str:
     os.makedirs(args.out, exist_ok=True)
 
     print(f"[train_lora_qwenvl] Loading processor + model: {args.model_id}")
     processor = AutoProcessor.from_pretrained(args.model_id)
 
-    # 4-bit quantization for your 3050 Ti
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
@@ -238,8 +198,9 @@ def main():
     )
 
     base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True)
+    if hasattr(base, "config"):
+        base.config.use_cache = False
 
-    # LoRA config
     lora_cfg = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -265,7 +226,6 @@ def main():
         f"trainable%: {100.0 * n_trainable / n_all:.4f}"
     )
 
-    # Datasets
     train_ds = QwenVLDataset(args.train)
     val_ds = QwenVLDataset(args.val) if args.val else None
 
@@ -275,7 +235,8 @@ def main():
 
     collator = QwenCollator(processor=processor, max_length=args.max_length)
 
-    # TrainingArguments (use new eval_strategy name)
+    # Avoid passing evaluation_strategy/save_strategy so this works with a
+    # wider range of Transformers versions. We skip scheduled evaluation.
     targs = TrainingArguments(
         output_dir=args.out,
         per_device_train_batch_size=args.bs,
@@ -284,8 +245,6 @@ def main():
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
         logging_steps=5,
-        eval_strategy=("epoch" if val_ds is not None else "no"),
-        save_strategy=("epoch" if val_ds is not None else "no"),
         remove_unused_columns=False,
         fp16=True,
         report_to="none",
@@ -298,12 +257,64 @@ def main():
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
-        processing_class=processor,
+        tokenizer=processor.tokenizer,
     )
 
     trainer.train()
     trainer.save_model(args.out)
-    print("Saved LoRA to:", args.out)
+    print("Saved Qwen LoRA to:", args.out)
+    return args.out
+
+
+def run_qwenvl_lora(
+    train_path: str,
+    out_dir: str,
+    model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct",
+    val_path: Optional[str] = None,
+    epochs: int = 1,
+    bs: int = 1,
+    ga: int = 8,
+    lr: float = 2e-4,
+    max_length: int = 1024,
+) -> str:
+    """
+    Programmatic entry point used by Streamlit dashboard.
+    """
+    args = argparse.Namespace(
+        train=train_path,
+        val=val_path,
+        out=out_dir,
+        model_id=model_id,
+        epochs=epochs,
+        bs=bs,
+        ga=ga,
+        lr=lr,
+        max_length=max_length,
+    )
+    return _run_from_args(args)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="LoRA fine-tuning for Qwen2.5-VL on traffic captions (jsonl)."
+    )
+    ap.add_argument("--train", required=True, help="Train jsonl (image/prompt/answer per line)")
+    ap.add_argument("--val", help="Val jsonl (optional)")
+    ap.add_argument("--out", required=True, help="Output dir for LoRA")
+    ap.add_argument(
+        "--model_id",
+        default="Qwen/Qwen2.5-VL-3B-Instruct",
+        help="Base Qwen2.5-VL model",
+    )
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--bs", type=int, default=1)
+    ap.add_argument("--ga", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument(
+        "--max_length", type=int, default=1024, help="Max token length for text sequence"
+    )
+    args = ap.parse_args()
+    _run_from_args(args)
 
 
 if __name__ == "__main__":

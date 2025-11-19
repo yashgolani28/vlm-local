@@ -44,11 +44,19 @@ def call_llava_single_image(
 ) -> str:
     """
     Call LLaVA via Ollama with a single base64 JPEG image.
-    Payload matches your vlm_dashboard.py.
     """
     payload = {
         "model": model_name,
         "stream": False,
+        "options": {
+            # context window (prompt + answer); 4096 is safe for llava:13b
+            "num_ctx": 4096,
+            # max new tokens to generate – bump this to get longer answers
+            "num_predict": 900,
+            # sampling – keep slightly conservative for consistency
+            "temperature": 0.2,
+            "top_p": 0.9,
+        },
         "messages": [
             {
                 "role": "user",
@@ -57,10 +65,10 @@ def call_llava_single_image(
             }
         ],
     }
+
     resp = requests.post(ollama_url, json=payload, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
-    # Ollama chat API returns: {"message": {"role": "...", "content": "..."} , ...}
     return data["message"]["content"]
 
 

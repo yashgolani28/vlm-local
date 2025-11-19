@@ -22,7 +22,6 @@ CLASS_MAPPING = {
     29: "T", 30: "U", 31: "V", 32: "W", 33: "X", 34: "Y", 35: "Z",
 }
 
-# minimal list of India state / UT codes used by llava_video_test.py
 INDIA_STATE_CODES = {
     "AN", "AP", "AR", "AS", "BR", "CH", "CG", "DD", "DL", "DN",
     "GA", "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD",
@@ -32,7 +31,6 @@ INDIA_STATE_CODES = {
 
 __all__ = ["INDIA_STATE_CODES", "run_anpr", "run_anpr_multi"]
 
-# lazy-loaded models (so importing anpr.py is cheap)
 _DET_MODEL = None
 _CHAR_MODEL = None
 
