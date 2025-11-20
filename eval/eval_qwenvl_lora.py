@@ -2,7 +2,7 @@
 """
 Evaluation harness for Qwen2.5-VL LoRA on traffic captions.
 
-- Loads base Qwen2.5-VL-3B-Instruct in 4-bit.
+- Loads base Qwen2.5-VL-7B-Instruct in 4-bit.
 - Applies LoRA adapter from --lora_dir.
 - Runs on a jsonl file with fields: image, prompt, answer.
 - Prints a few sample generations and a crude substring hit rate.
@@ -93,7 +93,7 @@ def main():
     ap.add_argument(
         "--model_id",
         type=str,
-        default="Qwen/Qwen2.5-VL-3B-Instruct",
+        default="Qwen/Qwen2.5-VL-7B-Instruct",
         help="Base Qwen2.5-VL model id",
     )
     ap.add_argument(

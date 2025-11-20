@@ -1,110 +1,124 @@
-import os, json, argparse, random
-from typing import List, Dict, Any
+import os
+import io
+import json
+import argparse
+import random
+import base64
+from typing import Any, Dict, List
 
-import torch
+import requests
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForCausalLM
-from peft import PeftModel
+
+# Match your dashboard defaults:
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL_NAME", "llava:13b")
 
 
-def read_jsonl(path: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def read_jsonl(path: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
+            rows.append(json.loads(line))
     return rows
 
 
-def generate_one(
-    model: AutoModelForCausalLM,
-    processor: AutoProcessor,
-    image_path: str,
-    prompt: str,
-    max_new_tokens: int = 160,
-) -> str:
-    device = model.device
-    img = Image.open(image_path).convert("RGB")
+def image_to_b64_jpeg(path: str, max_long_side: int = 480) -> str:
+    """
+    Load an image, downscale longest side to max_long_side, encode as JPEG -> base64.
+    Mirrors the dashboard's 'resize for VLM' idea so eval ~= live behavior.
+    """
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    long_side = max(w, h)
+    if long_side > max_long_side:
+        scale = max_long_side / float(long_side)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        img = img.resize((new_w, new_h), Image.BILINEAR)
 
-    # Chat-style input with image + text, same as training template
-    msgs = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-    inputs = processor.apply_chat_template(
-        msgs,
-        add_generation_prompt=True,
-        return_tensors="pt",
-    )
-    pixel_values = processor(images=img, return_tensors="pt")["pixel_values"]
-
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    pixel_values = pixel_values.to(device)
-
-    with torch.no_grad():
-        out = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask", None),
-            pixel_values=pixel_values,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=0.0,
-        )
-
-    # Strip off the prompt part
-    prompt_len = inputs["input_ids"].shape[1]
-    new_tokens = out[0][prompt_len:]
-    text = processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return text.strip()
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return b64
 
 
-def main():
+def call_ollama_llava_single(img_path: str, prompt: str) -> str:
+    """
+    Call Ollama LLaVA 13B with a single image + text prompt.
+    Matches the shape used in vlm_dashboard.call_llava_single_image.
+    """
+    b64 = image_to_b64_jpeg(img_path)
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "stream": False,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [b64],
+            }
+        ],
+    }
+
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=600)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["message"]["content"]
+
+
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="jsonl file with image/prompt/answer")
-    ap.add_argument("--model_id", default="llava-hf/llava-1.5-7b-hf")
-    ap.add_argument("--lora_dir", default="", help="Path to trained LoRA directory")
-    ap.add_argument("--num_samples", type=int, default=5)
+    ap.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help="Jsonl with image/prompt/answer rows (e.g. data/traffic_captions_val.jsonl)",
+    )
+    ap.add_argument(
+        "--num_samples",
+        type=int,
+        default=8,
+        help="How many random samples to print for inspection",
+    )
+    ap.add_argument(
+        "--max_eval",
+        type=int,
+        default=64,
+        help="Max rows to score for the substring metric (for speed)",
+    )
     args = ap.parse_args()
 
     rows = read_jsonl(args.data)
     if not rows:
         raise SystemExit(f"No rows found in {args.data}")
 
+    print(f"[eval-ollama] Loaded {len(rows)} rows from {args.data}")
+    print(f"[eval-ollama] Using OLLAMA_URL={OLLAMA_URL}, model={OLLAMA_MODEL}")
+
+    # Shuffle once
     random.shuffle(rows)
-    rows = rows[: args.num_samples]
 
-    print("Loading model + processor...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if torch.cuda.is_available() else None
+    # ---- Pretty examples ----
+    sample_rows = rows[: args.num_samples]
+    print("\n=== SAMPLE GENERATIONS (Ollama LLaVA 13B) ===")
+    for r in sample_rows:
+        img_path = r["image"]
+        prompt = r["prompt"]
+        gold = r.get("answer", "")
 
-    processor = AutoProcessor.from_pretrained(args.model_id)
-    base = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
-
-    if args.lora_dir and os.path.isdir(args.lora_dir):
-        base = PeftModel.from_pretrained(base, args.lora_dir)
-
-    base.eval()
-
-    for obj in rows:
-        img_path = obj["image"]
-        prompt = obj["prompt"]
-        gold = obj.get("answer", "")
-
-        pred = generate_one(base, processor, img_path, prompt, max_new_tokens=160)
+        try:
+            pred = call_ollama_llava_single(img_path, prompt)
+        except Exception as e:
+            print("===")
+            print(f"Image:  {img_path}")
+            print(f"Prompt: {prompt}")
+            print(f"ERROR calling Ollama: {e}")
+            print("===")
+            continue
 
         print("===")
         print(f"Image:  {img_path}")
@@ -112,6 +126,40 @@ def main():
         print(f"Pred:   {pred}")
         print(f"Gold:   {gold}")
         print("===")
+
+    # ---- Crude substring metric on a small batch ----
+    eval_rows = rows[: args.max_eval]
+    hit = 0
+    total = 0
+
+    print("\n[eval-ollama] Running substring sanity metric on "
+          f"{len(eval_rows)} rows...")
+
+    for r in eval_rows:
+        gold = (r.get("answer") or "").strip()
+        if not gold:
+            continue
+
+        img_path = r["image"]
+        prompt = r["prompt"]
+
+        try:
+            pred = call_ollama_llava_single(img_path, prompt)
+        except Exception as e:
+            print(f"[warn] Skipping row (error calling Ollama): {e}")
+            continue
+
+        total += 1
+        if gold.lower() in pred.lower():
+            hit += 1
+
+    if total > 0:
+        print(
+            f"\n[eval-ollama] exact-substring hits: {hit}/{total} "
+            f"({100.0 * hit / total:.1f}%)"
+        )
+    else:
+        print("\n[eval-ollama] No non-empty gold answers to score.")
 
 
 if __name__ == "__main__":

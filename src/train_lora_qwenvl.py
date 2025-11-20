@@ -182,7 +182,7 @@ def _run_from_args(args: argparse.Namespace) -> str:
     os.makedirs(args.out, exist_ok=True)
 
     print(f"[train_lora_qwenvl] Loading processor + model: {args.model_id}")
-    processor = AutoProcessor.from_pretrained(args.model_id)
+    processor = AutoProcessor.from_pretrained(args.model_id, use_fast=True)
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,

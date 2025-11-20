@@ -2325,9 +2325,7 @@ with tab_dataset:
                             _run_autocap_ds,
                         )
 
-                    st.success(
-                        f"Auto-captioning completed. Captions written to: {out_jsonl}"
-                    )
+                    st.success(f"Auto-captioning complete. Captions written to: {out_jsonl}")
                 except Exception as e:
                     st.error(f"Auto-captioning failed: {e}")
 
@@ -2567,7 +2565,7 @@ python src\\train_lora_qwenvl.py `
                     )
                 except Exception as e:
                     st.error(f"Full pipeline failed: {e}")
-                    
+
     # =========================
     # Training / auto-caption logs viewer
     # =========================
