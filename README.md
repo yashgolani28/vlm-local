@@ -22,12 +22,13 @@ Designed to run fully offline on a single GPU box (tested on **RTX 4060 Ti 16 GB
 ## 1. Quick setup (copy–paste)
 
 From a fresh machine / repo clone:
-
+````
 ```bash
 # clone
 git clone https://github.com/yashgolani28/vlm-local.git
 cd vlm-local
-
+```
+````
 # create venv
 python -m venv .venv
 
