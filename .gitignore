@@ -1,44 +1,66 @@
-# virtual env
-.venv/
-venv/
-
-# python
+# ---- Python / build artifacts ----
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+*.so
+*.dll
 
-# model + cache dirs
-models/
-checkpoints/
-weights/
-outputs/
-logs/
-wandb/
-.cache/
-.qdrant/
+# Byte-compiled / optimized / DLL files
+*.egg-info/
+dist/
+build/
 
-# data (keep only small configs)
-data/
-snapshots/
-retrieval_db/
-qdrant_storage/
-*.db
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+.env.*
 
-# IDE / OS junk
+# IDE / editor
 .vscode/
 .idea/
-*.log
+*.code-workspace
+
+# OS junk
 .DS_Store
 Thumbs.db
 
-# env / secrets
-.env
-.env.*
-*.secret
+# Streamlit state
+.streamlit/
 
-# local media / samples
-assets/
+# Logs
+logs/
+*.log
 
-# debug / temp data
-src/retrieval_embeddings_debug.npy
+# ---- Project-specific: data & media ----
+# Raw / generated media – keep repo light
+data/retrieval_images/
+data/retrieval_videos/
+data/snapshots/
+data/snapshots_retrieval/
+data/traffic_images/
+snapshots/
+
+# Large JSONLs you don’t want on GitHub by default
+data/*.jsonl
+
+# ---- Weights & checkpoints ----
+# YOLO / ANPR / detector weights
+weights/*.pt
+weights/*.pth
+weights/*.onnx
+
+# LoRA & HF adapters
+outputs/
+*.safetensors
+
+# Local test videos/images anywhere
+**/*.mp4
+**/*.avi
+**/*.mkv
+**/*.mov
+**/*.png
+**/*.jpg
+**/*.jpeg
